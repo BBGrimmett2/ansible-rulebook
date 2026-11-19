@@ -18,8 +18,6 @@ import logging
 import os
 import ssl
 import time
-from functools import cached_property
-from http import HTTPStatus
 from typing import Optional, Union
 from urllib.parse import urljoin
 
@@ -77,6 +75,7 @@ class AOWorkflowRunner:
     """
 
     WORKFLOWS_SLUG = "api/v1/workflows"
+    PROJECTS_SLUG = "api/v1/projects"
     WEBHOOKS_SLUG = "api/v1/webhooks"  # Workflow webhook triggers (not /eda/)
     EXECUTIONS_SLUG = "api/v1/executions"
     AUTH_SLUG = "api/v1/auth/login"
@@ -90,6 +89,9 @@ class AOWorkflowRunner:
         "cancelled",
     ]
     SUCCESS_STATUSES = ["completed"]
+    # Seconds before its reported expiry at which a cached access token is
+    # no longer used
+    TOKEN_EXPIRY_MARGIN = 60
     PARTIAL_SUCCESS_STATUSES = ["completed_with_errors"]
     FAILURE_STATUSES = ["failed", "cancelled"]
 
@@ -125,7 +127,8 @@ class AOWorkflowRunner:
             - EDA_AO_SSL_VERIFY
         """
         # Use environment variables as fallback if arguments not provided
-        # Prioritize OAuth2 client credentials (recommended for AO service accounts)
+        # Prioritize OAuth2 client credentials (recommended for AO service
+        # accounts)
         self.token = token
         self._host = ""
         self.host = host or os.environ.get("EDA_AO_URL", "")
@@ -133,7 +136,8 @@ class AOWorkflowRunner:
         self.client_secret = client_secret or os.environ.get(
             "EDA_AO_CLIENT_SECRET", ""
         )
-        # Username/password kept for backwards compatibility but not recommended
+        # Username/password kept for backwards compatibility but not
+        # recommended
         self.username = username
         self.password = password
         # For verify_ssl, only use default if no arg and no env var
@@ -143,7 +147,15 @@ class AOWorkflowRunner:
             self.verify_ssl = verify_ssl
         self._session = None
         self._raw_session = None
+        self._post_retry_options = None
         self._access_token = None
+        self._access_token_expires_at = None
+        self._access_token_key = None
+        self._sslcontext_key = None
+        self._sslcontext_value = False
+        # A runner created by with_overrides() already carries the settings
+        # resolved from the environment and must not read them again.
+        self._use_environment = True
 
     @property
     def host(self):
@@ -161,7 +173,7 @@ class AOWorkflowRunner:
         if self._raw_session:
             await self._raw_session.close()
             self._raw_session = None
-        self._access_token = None
+        self._invalidate_access_token()
 
     def _create_session(self):
         """Create aiohttp session with retry logic."""
@@ -178,7 +190,23 @@ class AOWorkflowRunner:
                 statuses={429, 500, 502, 503, 504},
                 retry_all_server_errors=False,
                 exceptions={aiohttp.ClientConnectorError},
-                methods={"GET", "POST"},
+                methods={"GET"},
+            )
+            # POST retries are limited to 429/502/503, as in
+            # job_template_runner. A webhook POST starts a workflow
+            # execution and AO provides no idempotency for it, so a POST
+            # answered with 500 or 504 is not sent again: the gateway may
+            # return them after AO accepted the request, and a second
+            # POST would start the workflow twice.
+            self._post_retry_options = ExponentialRetry(
+                attempts=settings.controller_retry_attempts,
+                start_timeout=2.0,
+                max_timeout=settings.controller_retry_max_timeout,
+                factor=2.0,
+                statuses={429, 502, 503},
+                retry_all_server_errors=False,
+                exceptions={aiohttp.ClientConnectorError},
+                methods={"POST"},
             )
             self._session = RetryClient(
                 client_session=client_session,
@@ -186,9 +214,21 @@ class AOWorkflowRunner:
                 raise_for_status=True,
             )
 
-    @cached_property
+    @property
     def _sslcontext(self) -> Union[bool, ssl.SSLContext]:
-        """Get SSL context for HTTPS connections."""
+        """Get SSL context for HTTPS connections.
+
+        The context is rebuilt whenever the host or the verify_ssl setting
+        changes, so a new setting is never ignored in favor of an old one.
+        """
+        key = (self.host, self.verify_ssl)
+        if self._sslcontext_key != key:
+            self._sslcontext_value = self._build_sslcontext()
+            self._sslcontext_key = key
+        return self._sslcontext_value
+
+    def _build_sslcontext(self) -> Union[bool, ssl.SSLContext]:
+        """Translate verify_ssl (yes/no/<CA bundle>) into an aiohttp value."""
         if self.host.startswith("https"):
             if self.verify_ssl.lower() in ["yes", "true"]:
                 return True
@@ -202,6 +242,9 @@ class AOWorkflowRunner:
         This is called lazily to ensure environment variables set by AAP EDA
         credentials are available before we try to use them.
         """
+        if not self._use_environment:
+            return
+
         # Check for empty or default host (empty string becomes "/" via setter)
         if not self.host or self.host == "/":
             env_host = os.environ.get("EDA_AO_URL", "")
@@ -237,12 +280,55 @@ class AOWorkflowRunner:
 
         # Log what we have after loading
         logger.debug(
-            "AO credentials after env load: host=%s, has_token=%s, has_client_id=%s, has_client_secret=%s",
+            "AO credentials after env load: host=%s, has_token=%s, "
+            "has_client_id=%s, has_client_secret=%s",
             bool(self.host and self.host != "/"),
             bool(self.token),
             bool(self.client_id),
             bool(self.client_secret),
         )
+
+    def with_overrides(
+        self,
+        host: str = "",
+        client_id: str = "",
+        client_secret: str = "",
+        verify_ssl: str = "",
+    ) -> "AOWorkflowRunner":
+        """Create a runner for one action with its own connection settings.
+
+        The new runner starts from the settings of this runner and replaces
+        the ones given. This runner is left untouched, so the settings that
+        one action passes never reach another action.
+
+        Args:
+            host: AO base URL to use instead of the configured one
+            client_id: OAuth2 client ID to use instead of the configured one
+            client_secret: OAuth2 client secret to use instead of the
+                configured one
+            verify_ssl: SSL verification setting (yes/no/<path to CA bundle>)
+                to use instead of the configured one
+
+        Returns:
+            AOWorkflowRunner: A new runner; the caller must close its session
+        """
+        self._load_from_environment()
+        # Client credentials given to the action take precedence over a
+        # token or a username/password configured globally.
+        own_credentials = bool(client_id or client_secret)
+        runner = AOWorkflowRunner(
+            host=host or self.host,
+            token="" if own_credentials else self.token,
+            username="" if own_credentials else self.username,
+            password="" if own_credentials else self.password,
+            client_id=client_id or self.client_id,
+            client_secret=client_secret or self.client_secret,
+        )
+        # Set after the constructor: an explicit "yes" must not be replaced
+        # by EDA_AO_SSL_VERIFY, which the constructor does for the default.
+        runner.verify_ssl = verify_ssl or self.verify_ssl
+        runner._use_environment = False
+        return runner
 
     async def _get_access_token(self) -> str:
         """Authenticate and get access token.
@@ -260,13 +346,14 @@ class AOWorkflowRunner:
         if self.token:
             return self.token
 
-        # OAuth2 client_credentials flow (always fetch fresh token)
+        # Token obtained earlier with the current settings and still valid
+        cached_token = self._cached_access_token()
+        if cached_token:
+            return cached_token
+
+        # OAuth2 client_credentials flow
         if self.client_id and self.client_secret:
             return await self._get_oauth2_token()
-
-        # Cached token from username/password auth
-        if self._access_token:
-            return self._access_token
 
         # Username/password auth
         if self.username and self.password:
@@ -276,6 +363,67 @@ class AOWorkflowRunner:
             "Either token, client_id/client_secret, or username/password "
             "must be provided"
         )
+
+    def _credentials_key(self) -> tuple:
+        """Settings an access token was issued for."""
+        return (
+            self.host,
+            self.client_id,
+            self.client_secret,
+            self.username,
+            self.password,
+        )
+
+    def _cached_access_token(self) -> Optional[str]:
+        """Return the cached access token while it can still be used.
+
+        A token is reused only for the settings it was issued for and until
+        TOKEN_EXPIRY_MARGIN seconds before the expiry reported by AO.
+        """
+        if not self._access_token:
+            return None
+        if self._access_token_key != self._credentials_key():
+            return None
+        if (
+            self._access_token_expires_at is not None
+            and time.monotonic() >= self._access_token_expires_at
+        ):
+            return None
+        return self._access_token
+
+    def _invalidate_access_token(self) -> None:
+        """Forget the cached access token."""
+        self._access_token = None
+        self._access_token_expires_at = None
+        self._access_token_key = None
+
+    def _store_access_token(
+        self, access_token: str, expires_in, always: bool
+    ) -> None:
+        """Cache an access token until shortly before it expires.
+
+        Args:
+            access_token: Token returned by AO
+            expires_in: Lifetime in seconds reported by AO, if any
+            always: Cache the token even when AO reports no lifetime
+        """
+        try:
+            lifetime = float(expires_in)
+        except (TypeError, ValueError):
+            lifetime = None
+
+        if lifetime is None:
+            if not always:
+                return
+            expires_at = None
+        elif lifetime <= self.TOKEN_EXPIRY_MARGIN:
+            return
+        else:
+            expires_at = time.monotonic() + lifetime - self.TOKEN_EXPIRY_MARGIN
+
+        self._access_token = access_token
+        self._access_token_expires_at = expires_at
+        self._access_token_key = self._credentials_key()
 
     async def _get_oauth2_token(self) -> str:
         """Get OAuth2 token using client_credentials grant.
@@ -311,6 +459,11 @@ class AOWorkflowRunner:
                         "No access_token in OAuth2 response"
                     )
                 logger.debug("Successfully obtained OAuth2 access token")
+                # Reused until shortly before the expiry reported by AO.
+                # Without expires_in a new token is requested every time.
+                self._store_access_token(
+                    access_token, result.get("expires_in"), always=False
+                )
                 return access_token
         except aiohttp.ClientResponseError as e:
             logger.error("OAuth2 authentication failed: %s", e)
@@ -350,12 +503,15 @@ class AOWorkflowRunner:
                         "Empty authentication response"
                     )
                 result = json.loads(response_text)
-                self._access_token = result.get("access_token")
-                if not self._access_token:
+                access_token = result.get("access_token")
+                if not access_token:
                     raise AOAuthenticationException(
                         "No access_token in authentication response"
                     )
-                return self._access_token
+                self._store_access_token(
+                    access_token, result.get("expires_in"), always=True
+                )
+                return access_token
         except aiohttp.ClientResponseError as e:
             logger.error("Authentication failed: %s", e)
             raise AOAuthenticationException(
@@ -381,71 +537,155 @@ class AOWorkflowRunner:
         Raises:
             AOWorkflowRunnerException: If request fails
         """
-        access_token = await self._get_access_token()
-        url = urljoin(self.host, path)
+        base_headers = kwargs.pop("headers", {})
 
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {access_token}"
+        for attempt in (1, 2):
+            # Load the settings first: the cache is checked against them
+            self._load_from_environment()
+            from_cache = self._cached_access_token() is not None
+            access_token = await self._get_access_token()
+            url = urljoin(self.host, path)
 
-        try:
-            self._create_session()
-            async with self._session.request(
-                method, url, headers=headers, ssl=self._sslcontext, **kwargs
-            ) as response:
-                response_text = await response.text()
-                if not response_text:
-                    return {}
-                try:
-                    return json.loads(response_text)
-                except json.JSONDecodeError as e:
-                    logger.error(CLIENT_INVALID_JSON_STRING, url, str(e))
-                    raise AOWorkflowRunnerException(
-                        f"Invalid JSON response from AO: {e}"
-                    ) from e
-        except aiohttp.ClientError as e:
-            logger.error(CLIENT_CONNECT_ERROR_STRING, str(e))
-            raise AOWorkflowRunnerException(
-                f"AO API request failed: {e}"
-            ) from e
+            headers = dict(base_headers)
+            headers["Authorization"] = f"Bearer {access_token}"
+
+            try:
+                self._create_session()
+                if method.upper() == "POST":
+                    kwargs["retry_options"] = self._post_retry_options
+                async with self._session.request(
+                    method,
+                    url,
+                    headers=headers,
+                    ssl=self._sslcontext,
+                    **kwargs,
+                ) as response:
+                    response_text = await response.text()
+                    if not response_text:
+                        return {}
+                    try:
+                        return json.loads(response_text)
+                    except json.JSONDecodeError as e:
+                        logger.error(CLIENT_INVALID_JSON_STRING, url, str(e))
+                        raise AOWorkflowRunnerException(
+                            f"Invalid JSON response from AO: {e}"
+                        ) from e
+            except aiohttp.ClientError as e:
+                rejected_cached_token = (
+                    isinstance(e, aiohttp.ClientResponseError)
+                    and e.status == 401
+                    and from_cache
+                    and attempt == 1
+                )
+                if rejected_cached_token:
+                    # The token was revoked or expired earlier than reported
+                    logger.debug(
+                        "AO rejected the cached access token, "
+                        "requesting a new one"
+                    )
+                    self._invalidate_access_token()
+                    continue
+                logger.error(CLIENT_CONNECT_ERROR_STRING, str(e))
+                raise AOWorkflowRunnerException(
+                    f"AO API request failed: {e}"
+                ) from e
+
+    async def _lookup_project_id(self, project: str) -> str:
+        """Look up the ID of a project by its name.
+
+        Args:
+            project: Name of the project
+
+        Returns:
+            str: ID of the project
+
+        Raises:
+            AOWorkflowNotFoundException: If the project is not found
+        """
+        result = await self._api_request(
+            "GET", self.PROJECTS_SLUG, params={"name": project}
+        )
+        for candidate in result.get("resources", []):
+            if candidate.get("name") == project:
+                return candidate["id"]
+
+        raise AOWorkflowNotFoundException(f"Project '{project}' not found")
 
     async def lookup_webhook_path(
         self, workflow_name: str, project: Optional[str] = None
     ) -> str:
-        """Look up webhook path for a workflow by name.
+        """Look up the webhook path of a workflow by the workflow name.
+
+        The webhook path is not part of the workflow itself. It is a
+        parameter of the webhook trigger in the published version of the
+        workflow, so the lookup takes up to three requests: project (when
+        given), workflow and published version.
 
         Args:
             workflow_name: Name of the workflow
-            project: Optional project name to narrow search
+            project: Optional project name, needed when workflows in
+                different projects have the same name
 
         Returns:
             str: Webhook path for the workflow
 
         Raises:
-            AOWorkflowNotFoundException: If workflow not found
+            AOWorkflowNotFoundException: If the project or the workflow is
+                not found, the name is ambiguous, the workflow is not
+                published, or it does not have exactly one webhook trigger
         """
+        where = f" in project '{project}'" if project else ""
         params = {"name": workflow_name}
         if project:
-            params["project"] = project
+            params["project_id"] = await self._lookup_project_id(project)
 
         result = await self._api_request(
             "GET", self.WORKFLOWS_SLUG, params=params
         )
-
-        workflows = result.get("results", [])
+        workflows = [
+            workflow
+            for workflow in result.get("resources", [])
+            if workflow.get("name") == workflow_name
+        ]
         if not workflows:
             raise AOWorkflowNotFoundException(
-                f"Workflow '{workflow_name}' not found"
-                + (f" in project '{project}'" if project else "")
+                f"Workflow '{workflow_name}' not found{where}"
+            )
+        if len(workflows) > 1:
+            raise AOWorkflowNotFoundException(
+                f"More than one workflow named '{workflow_name}' "
+                f"found{where}, set 'project' or use 'webhook_path'"
             )
 
         workflow = workflows[0]
-        webhook_path = workflow.get("webhook_path")
-        if not webhook_path:
+        version = workflow.get("published_version_number")
+        if not version:
             raise AOWorkflowNotFoundException(
-                f"Workflow '{workflow_name}' has no webhook_path configured"
+                f"Workflow '{workflow_name}' has no published version"
             )
 
-        return webhook_path
+        published = await self._api_request(
+            "GET", f"{self.WORKFLOWS_SLUG}/{workflow['id']}/versions/{version}"
+        )
+        definition = published.get("workflow_definition") or {}
+        webhook_paths = [
+            trigger["parameters"]["webhook_path"]
+            for trigger in definition.get("triggers") or []
+            if trigger.get("type") == "webhook_trigger"
+            and (trigger.get("parameters") or {}).get("webhook_path")
+        ]
+        if not webhook_paths:
+            raise AOWorkflowNotFoundException(
+                f"Workflow '{workflow_name}' has no webhook trigger in its "
+                f"published version"
+            )
+        if len(webhook_paths) > 1:
+            raise AOWorkflowNotFoundException(
+                f"Workflow '{workflow_name}' has more than one webhook "
+                f"trigger ({', '.join(webhook_paths)}), use 'webhook_path'"
+            )
+
+        return webhook_paths[0]
 
     async def trigger_workflow(
         self, webhook_path: str, payload: Optional[dict] = None
@@ -453,7 +693,8 @@ class AOWorkflowRunner:
         """Trigger a workflow via EDA webhook.
 
         Args:
-            webhook_path: Webhook UUID or path (e.g., "755d5f81-a574-4ea3-8461-1934cb4a5c51")
+            webhook_path: Webhook UUID or path
+                (e.g., "755d5f81-a574-4ea3-8461-1934cb4a5c51")
             payload: Optional payload data to send
 
         Returns:
@@ -553,21 +794,34 @@ class AOWorkflowRunner:
                 )
                 raise
             except AOWorkflowRunnerException as e:
-                # Check if this wraps a 4xx client error - those won't fix themselves
+                # Check if this wraps a 4xx client error - those won't fix
+                # themselves
                 # Exception: 429 (rate limit) is transient, keep polling
                 if e.__cause__ and isinstance(
                     e.__cause__, aiohttp.ClientResponseError
                 ):
                     status = e.__cause__.status
+                    if status == 403:
+                        # Being authorized on the webhook trigger allows the
+                        # trigger only, reading the execution needs a role.
+                        raise AOWorkflowRunnerException(
+                            f"Not allowed to read execution {execution_id}. "
+                            "The workflow was triggered, but its status "
+                            "cannot be checked: the service account needs a "
+                            "role that can read executions in the project "
+                            "of the workflow, for example project-auditor"
+                        ) from e.__cause__
                     if 400 <= status < 500 and status != 429:
                         logger.error(
-                            "Client error for execution %s (status %d), failing immediately: %s",
+                            "Client error for execution %s (status %d), "
+                            "failing immediately: %s",
                             execution_id,
                             status,
                             e,
                         )
                         raise
-                # Retry transient errors (network issues, 5xx server errors, rate limits)
+                # Retry transient errors (network issues, 5xx server errors,
+                # rate limits)
                 logger.warning(
                     "Error checking execution status, will retry: %s", e
                 )
